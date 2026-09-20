@@ -1,0 +1,201 @@
+<p>Na parte anterior o ambiente ficou de pé e o texto do PDF saiu limpo no terminal. Agora esse texto vai para o banco em pedaços, com os vetores que o Laravel AI SDK gera, e a primeira busca semântica começa a funcionar. Ainda sem modelo generativo no meio.</p>
+<p>Vale relembrar onde estamos. O sistema precisa responder quais documentos um edital exige, e para isso o modelo de linguagem vai precisar ler os trechos certos do edital. Essa parte do trabalho não tem nada de inteligência artificial: é recortar o documento, transformar cada recorte em um vetor e guardar no banco de um jeito que permita achar o recorte certo depois. É a parte que sustenta todo o resto, e também a que costuma ser mal explicada.</p>
+<p>A boa notícia é que o SDK resolve a parte dos vetores em uma linha. O resto é PHP comum.</p>
+<h2 id="sumario">Neste artigo</h2>
+<ul><li><a href="#models">Os models</a></li><li><a href="#paginas">Como preservar a página</a></li><li><a href="#corte">Como cortar o texto</a></li><li><a href="#embeddings">Como gerar os embeddings</a></li><li><a href="#ingestao">Como executar a ingestão</a></li><li><a href="#busca">Como testar a busca vetorial</a></li><li><a href="#resultado">O que a recuperação mostrou</a></li><li><a href="#limites">O que ficou de fora</a></li></ul>
+<h2 id="models">Os dois models</h2>
+<p>Nesta etapa trabalharemos em app/Models/Document.php e app/Models/DocumentChunk.php. O primeiro representa o PDF e expõe a relação com seus pedaços.</p>
+<p>Arquivo: app/Models/Document.php</p>
+<pre><code>&lt;?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+class Document extends Model
+{
+    protected $fillable = [
+        'original_name',
+        'storage_path',
+        'status',
+        'page_count',
+        'extracted_text',
+    ];
+
+    public function chunks(): HasMany
+    {
+        return $this-&gt;hasMany(DocumentChunk::class);
+    }
+}</code></pre>
+<p>No DocumentChunk ficam o cast do vetor e a proteção que impede o embedding de entrar na serialização.</p>
+<p>Arquivo: app/Models/DocumentChunk.php</p>
+<pre><code>&lt;?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Casts\AsVector;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class DocumentChunk extends Model
+{
+    protected $fillable = [
+        'document_id',
+        'page',
+        'content',
+        'embedding',
+    ];
+
+    protected $hidden = [
+        'embedding',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'embedding' =&gt; AsVector::class,
+        ];
+    }
+
+    public function document(): BelongsTo
+    {
+        return $this-&gt;belongsTo(Document::class);
+    }
+}</code></pre>
+<p>O cast AsVector faz a ponte entre o array de floats que você tem no PHP e o tipo vector do Postgres. Sem ele você ficaria montando string no formato que o pgvector espera, o que funciona e é chato. Com ele, você atribui um array e pronto.</p>
+<p>O $hidden vai fazer sentido no próximo artigo, quando o agente receber esses models serializados. Adiantando o motivo: 1536 floats por trecho entupiriam o contexto sem acrescentar nada que o modelo saiba ler.</p>
+<h2 id="paginas">Como saber a página de cada pedaço</h2>
+<p>Quando o sistema disser que a certidão negativa de falência está exigida, você vai querer conferir no PDF. Então cada pedaço precisa carregar a página de onde saiu.</p>
+<p>No artigo anterior a gente viu que ler isso do rodapé não funciona, porque o Word espaçou as letras e o rodapé sai como P á g i n a 12 | 48. Existe um caminho melhor e que não depende de como o documento foi escrito. O pdftotext insere um caractere de form feed, o \f, entre uma página e outra. Ele está sempre lá, em qualquer PDF, seja o rodapé bonito ou inexistente.</p>
+<p>Então quebrar o texto nesse caractere entrega as páginas em ordem, e o índice do array é o número da página. Há uma sutileza: algumas versões do pdftotext também colocam um form feed depois da última página. O explode cria, nesse caso, um elemento vazio no fim. Se ele entrar na contagem, um edital de 48 páginas passa a ter 49.</p>
+<p>Arquivo: app/Services/EditalIngestor.php</p>
+<pre><code>private function extractPages(string $text): array
+{
+    $pages = explode("\f", $text);
+
+    while ($pages !== [] &amp;&amp; trim($pages[array_key_last($pages)]) === '') {
+        array_pop($pages);
+    }
+
+    return $pages;
+}
+
+private function splitIntoChunks(array $pages): array
+{
+    $chunks = [];
+
+    foreach ($pages as $index =&gt; $pageText) {
+        foreach ($this-&gt;splitPage($pageText) as $content) {
+            $chunks[] = [
+                'content' =&gt; $content,
+                'page' =&gt; $index + 1,
+            ];
+        }
+    }
+
+    return $chunks;
+}</code></pre>
+<p>O texto completo continua sem trim antes da separação. A limpeza ocorre só nos elementos vazios do fim, depois do explode. Assim a divisão das páginas permanece visível e a contagem vem de count($pages), não de uma suposição sobre quantos separadores o executável produz.</p>
+<p>Esse arranjo tem um efeito colateral que vale assumir de forma explícita. Como o corte acontece dentro de cada página, um trecho que atravessa a virada de página fica partido em dois. Perde-se um pouco de continuidade e ganha-se a citação, e para um sistema em que conferir importa mais que ler bonito, é uma troca que vale.</p>
+<h2 id="corte">O corte, deliberadamente burro</h2>
+<p>Aqui cabe uma escolha de escopo. Dá para cortar o edital por cláusula, aproveitando que a numeração vem sempre no começo da linha, no formato 7.1.1.. Fica melhor, e fica mais código. Como o objetivo aqui é mostrar o SDK e entender RAG, o corte vai ser o mais simples que funciona: acumula parágrafos até encher um tamanho fixo e repete o final do pedaço anterior como sobreposição.</p>
+<p>Arquivo: app/Services/EditalIngestor.php</p>
+<pre><code>private const CHUNK_SIZE = 1200;
+
+private const CHUNK_OVERLAP = 200;
+
+private function splitPage(string $pageText): array
+{
+    $paragraphs = preg_split('/\n\s*\n/', $pageText, flags: PREG_SPLIT_NO_EMPTY) ?: [];
+
+    $chunks = [];
+    $current = '';
+
+    foreach ($paragraphs as $paragraph) {
+        $paragraph = trim($paragraph);
+
+        if ($paragraph === '') {
+            continue;
+        }
+
+        if (mb_strlen($current) + mb_strlen($paragraph) &gt; self::CHUNK_SIZE &amp;&amp; $current !== '') {
+            $chunks[] = trim($current);
+            $current = mb_substr($current, -self::CHUNK_OVERLAP)."\n\n";
+        }
+
+        $current .= $paragraph."\n\n";
+    }
+
+    if (trim($current) !== '') {
+        $chunks[] = trim($current);
+    }
+
+    return $chunks;
+}</code></pre>
+<p>A sobreposição merece uma palavra, porque é o parâmetro que mais confunde. Se você cortar o texto em pedaços justapostos, sem repetição, uma exigência que caia exatamente na fronteira vira duas metades sem sentido, e nenhuma das duas responde à pergunta. Repetir os últimos caracteres do pedaço anterior no começo do seguinte resolve isso na maior parte dos casos. O custo é redundância, que é barata.</p>
+<h2 id="embeddings">A parte que é o SDK</h2>
+<p>Chegamos ao ponto do artigo. Gerar os embeddings é isto:</p>
+<p>Arquivo: app/Services/EditalIngestor.php</p>
+<pre><code>use Laravel\Ai\Embeddings;
+
+$response = Embeddings::for($texts)-&gt;generate();
+
+$response-&gt;embeddings; // [[0.12, -0.04, ...], [0.98, 0.31, ...], ...]</code></pre>
+<p>Você passa uma lista de strings e recebe uma lista de vetores na mesma ordem. Nada de cliente HTTP, nada de montar payload, nada de tratar resposta. O modelo e as dimensões vêm do config/ai.php, então trocar de provedor depois é mudar configuração, não código.</p>
+<p>Na prática, três ajustes deixam a ingestão adequada para documentos maiores: timeout, cache e novas tentativas.</p>
+<p>O timeout foi definido em 120 segundos porque cada requisição envia um lote de trechos, não uma frase isolada.</p>
+<p>O segundo é o cache. O SDK sabe cachear embeddings usando provedor, modelo, dimensões e conteúdo como chave. Enquanto você ajusta o tamanho do pedaço e reprocessa o mesmo documento cinco vezes, isso economiza dinheiro de verdade.</p>
+<p>O terceiro é o retry, que não é do SDK e sim do Laravel. Uma ingestão longa faz várias chamadas de rede em sequência, e é questão de tempo até uma delas falhar por motivo passageiro. Deixar a ingestão inteira morrer por causa de um lote é desperdício.</p>
+<p>Com os três, o laço de vetorização fica assim:</p>
+<p>Arquivo: app/Services/EditalIngestor.php</p>
+<pre><code>foreach (array_chunk($chunks, 32) as $batch) {
+    $response = retry(
+        3,
+        fn () =&gt; Embeddings::for(array_column($batch, 'content'))
+            -&gt;timeout(120)
+            -&gt;cache()
+            -&gt;generate(),
+        sleepMilliseconds: 2000,
+    );
+
+    foreach ($batch as $index =&gt; $chunk) {
+        $document-&gt;chunks()-&gt;create([
+            'content' =&gt; $chunk['content'],
+            'page' =&gt; $chunk['page'],
+            'embedding' =&gt; $response-&gt;embeddings[$index],
+        ]);
+    }
+}</code></pre>
+<p>Esse trecho vive em um serviço, App\Services\EditalIngestor, e não dentro do comando. O motivo aparece no próximo artigo, quando o mesmo código precisar rodar a partir de um upload pela web. O laço também fica dentro de um try: se um lote falhar mesmo depois das tentativas, o documento muda de processing para failed. Sem essa transição, uma ingestão parcial poderia continuar parecendo ativa e ser escolhida por um comando posterior.</p>
+<h2 id="ingestao">Rodando</h2>
+<p>O serviço completo fica em app/Services/EditalIngestor.php. O comando que recebe o caminho do PDF e chama esse serviço fica em app/Console/Commands/IngestEdital.php.</p>
+<pre><code>docker compose exec app php artisan edital:ingest storage/app/edital.pdf</code></pre>
+<p>No edital de Vargem Bonita, 48 páginas, o resultado foram 117 pedaços. Levou poucos segundos e custou alguns centavos.</p>
+<h2 id="busca">A busca, sem nenhuma IA generativa</h2>
+<p>Agora a parte que mais ensina, e que quase todo tutorial atropela. Antes de colocar um modelo de linguagem na história, vale olhar a recuperação sozinha, porque é ela que determina o teto da qualidade de todo o resto. Se o trecho certo não for recuperado, nenhum modelo vai adivinhar o conteúdo dele.</p>
+<p>Arquivo: app/Console/Commands/SearchEdital.php</p>
+<pre><code>$chunks = DocumentChunk::query()
+    -&gt;where('document_id', $document-&gt;id)
+    -&gt;whereVectorSimilarTo('embedding', $query, minSimilarity: 0.2)
+    -&gt;limit(5)
+    -&gt;get();</code></pre>
+<p>A consulta faz três coisas que merecem atenção. Primeiro, restringe os pedaços ao documento escolhido; sem esse filtro, a segunda ingestão misturaria resultados de editais diferentes. Depois, recebe a pergunta em texto puro e deixa o Laravel gerar o embedding. Por fim, filtra pela similaridade mínima e já ordena o resultado, sem precisar de orderBy.</p>
+<p>O minSimilarity vai de 0 a 1, e é o parâmetro que você vai mexer mais. Alto demais e a busca não devolve nada. Baixo demais e devolve ruído. Num sistema de edital, onde deixar uma exigência passar custa a licitação, o erro menos grave é o do ruído, então o valor fica baixo de propósito.</p>
+<pre><code>docker compose exec app php artisan edital:search "documentos exigidos para habilitação"</code></pre>
+<h2 id="resultado">O que a saída real mostrou</h2>
+<p>E aqui o edital de verdade dá uma aula que documento de exemplo nunca daria.</p>
+<p>O primeiro resultado, o mais similar de todos, foi o item 7 do edital, cujo título é exatamente HABILITAÇÃO. Faz todo sentido para um modelo de embeddings: a pergunta era sobre documentos de habilitação e esse trecho é o que mais fala sobre habilitação no documento inteiro. O problema é que o item 7 não lista documento nenhum. Ele diz assim:</p>
+<p>Os documentos previstos no ANEXO II deste edital, necessários e suficientes para demonstrar a capacidade do licitante de realizar o objeto da licitação, serão exigidos para fins de habilitação.</p>
+<p>Ou seja, a busca acertou o trecho mais parecido com a pergunta e entregou uma resposta correta e completamente inútil. A lista concreta, com CNPJ, certidões, FGTS e CNDT, está no Anexo II, que apareceu só em quarto lugar, na página 38.</p>
+<p>Essa é a diferença entre parecido e útil, e é o limite fundamental da busca por similaridade pura. O vetor mede semelhança de assunto, não presença de resposta. Guarde essa observação, porque é ela que vai moldar as instruções do agente no próximo artigo.</p>
+<p>Também apareceu um pedaço quase vazio, com um fragmento de frase cortado no meio de uma palavra seguido do rodapé da página. É a sobreposição funcionando literalmente: ela pega os últimos duzentos caracteres sem olhar onde termina a palavra. Some com a ausência de limpeza de cabeçalho e rodapé, que a gente deixou de fora de propósito, e o resultado é um pedaço que só ocupa lugar no ranking.</p>
+<h2 id="limites">O que ficou de fora</h2>
+<p>De propósito, e vale listar para você saber que existe:</p>
+<ul><li>corte por cláusula em vez de tamanho fixo</li><li>busca por palavra-chave combinada com a vetorial, aproveitando a coluna content_tsv que já criamos</li><li>limpeza de cabeçalho e rodapé repetidos</li><li>deduplicação de pedaços quase idênticos</li><li>ingestão em fila</li><li>OCR para editais digitalizados</li></ul>
+<p>Cada um desses melhora o resultado, e nenhum é necessário para entender o mecanismo.</p>
+<h2>Na próxima parte</h2>
+<p>O banco já tem o edital vetorizado e a busca já encontra os trechos certos, com a ressalva de que o mais parecido não é o mais útil. Falta transformar isso em resposta. Na terceira parte entra o agente do SDK com saída estruturada, que recebe os trechos recuperados e devolve a lista de documentos em formato de checklist, mais uma tela para usar sem terminal.</p>
+<h2>Referências</h2>
+<p>LARAVEL. Laravel AI SDK. Documentação oficial, versão 13.x. Disponível em: https://laravel.com/framework/docs/ai-sdk. Acesso em: 18 set. 2026.</p>
+<p>MUNICÍPIO DE VARGEM BONITA. Pregão Eletrônico nº 006/2026: contratação de serviços de arbitragem esportiva. Processo Administrativo nº 012/2026. Vargem Bonita, SC, 2 fev. 2026. Disponível em: https://vargembonita.sc.gov.br/uploads/sites/93/2026/02/PL012.2026-PE006.2026-ARBITRAGEM.pdf. Acesso em: 18 set. 2026.</p>

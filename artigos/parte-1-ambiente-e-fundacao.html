@@ -1,0 +1,239 @@
+<p>RAG costuma aparecer em exemplos que escondem justamente a parte mais importante: como um documento real sai do disco, vira trechos pesquisáveis e chega a um modelo de linguagem com contexto suficiente para produzir uma resposta verificável. Nesta série vamos montar esse caminho inteiro com Laravel, sem pular da teoria direto para uma chamada de API.</p>
+<p>O projeto usa o Laravel AI SDK para gerar embeddings, fazer busca vetorial e executar um agente com saída estruturada. O PostgreSQL, com pgvector, guarda e recupera os trechos; no final, uma interface em React apresenta o resultado. A proposta é entender o papel de cada etapa e enxergar onde a qualidade de um RAG pode se perder.</p>
+<p>Para não construir o tutorial sobre frases artificiais, vamos trabalhar com um documento público de 48 páginas: o <a href="https://vargembonita.sc.gov.br/uploads/sites/93/2026/02/PL012.2026-PE006.2026-ARBITRAGEM.pdf">edital do Pregão Eletrônico nº 006/2026 de Vargem Bonita/SC</a>. Você pode baixar o PDF agora e usar o mesmo arquivo durante toda a série.</p>
+<p>A pergunta escolhida para testar o pipeline é objetiva: quais documentos de habilitação esse edital exige? A resposta está distribuída entre o corpo do documento e os anexos, o que nos obriga a lidar com recuperação, contexto, citações e contradições. O sistema deverá devolver cada documento acompanhado do trecho e da página que sustentam a resposta.</p>
+<p>A série está dividida em três partes:</p>
+<ol><li>preparar o ambiente, o PostgreSQL com pgvector e a extração do PDF;</li><li>cortar o texto, gerar embeddings e testar a busca por similaridade;</li><li>entregar a busca a um agente, validar a resposta com um schema e construir a interface.</li></ol>
+<p>Ao final, teremos um RAG pequeno o bastante para ser estudado arquivo por arquivo, mas completo o bastante para mostrar as decisões que mais influenciam a resposta: como cortar o documento, o que recuperar e quais evidências exigir do agente.</p>
+<h2 id="sumario">Neste artigo</h2>
+<ul><li><a href="#stack">O que vamos usar</a></li><li><a href="#escopo">Uma nota sobre o escopo</a></li><li><a href="#docker">Subindo o ambiente com Docker</a></li><li><a href="#projeto-laravel">Criando o projeto Laravel</a></li><li><a href="#conexao">Configurando a conexão</a></li><li><a href="#ai-sdk">Instalando o AI SDK</a></li><li><a href="#banco">Modelando o banco</a></li><li><a href="#schema">Conferindo o que foi criado</a></li><li><a href="#extracao">Extraindo o texto do PDF</a></li><li><a href="#resultado">O que a saída real mostrou</a></li></ul>
+<h2 id="stack">O que vamos usar</h2>
+<p>O Laravel AI SDK, pacote oficial que unifica o acesso aos provedores de IA. O PostgreSQL com a extensão pgvector, que o Laravel já suporta nativamente com uma coluna vector e métodos de busca por similaridade no query builder. A OpenAI como provedor. E Docker para tudo isso rodar igual na sua máquina e na minha.</p>
+<p>O edital de teste é o Pregão Eletrônico 006/2026 do município de Vargem Bonita, em Santa Catarina, para contratação de serviços de arbitragem esportiva. São 48 páginas, sob a Lei 14.133/2021, com termo de referência, estudo técnico preliminar e quatro anexos. O <a href="https://vargembonita.sc.gov.br/uploads/sites/93/2026/02/PL012.2026-PE006.2026-ARBITRAGEM.pdf">PDF pode ser baixado diretamente no site da prefeitura</a>.</p>
+<p>O Laravel AI SDK é recente. Confira a versão do pacote e do framework antes de copiar os comandos, porque a API pode ter mudado desde a publicação deste texto. Os exemplos aqui foram escritos sobre o Laravel 13.</p>
+<h2 id="escopo">Uma nota sobre o escopo</h2>
+<p>Este é um projeto de estudo, e isso muda as decisões. O objetivo é demonstrar como o SDK funciona em um fluxo de RAG completo, não entregar uma ferramenta pronta para produção. Sempre que houver escolha entre a solução simples e a solução robusta, o texto vai pela simples e anota a alternativa. No último artigo eu volto nessa lista de anotações e discuto o que um RAG mínimo deixa na mesa.</p>
+<h2 id="docker">Subindo o ambiente com Docker</h2>
+<p>Três coisas precisam existir: PHP com as extensões do PostgreSQL, o banco com pgvector já instalado, e o pdftotext para extrair o conteúdo do PDF. O Docker resolve as três de uma vez e evita a conversa chata de instalar pgvector na mão.</p>
+<p>Crie a pasta do projeto e dentro dela um arquivo docker/php/Dockerfile:</p>
+<pre><code>FROM php:8.4-cli-bookworm
+
+RUN apt-get update &amp;&amp; apt-get install -y \
+        git \
+        unzip \
+        curl \
+        ca-certificates \
+        libzip-dev \
+        libpq-dev \
+        libicu-dev \
+        poppler-utils \
+    &amp;&amp; docker-php-ext-install pdo_pgsql pgsql zip intl \
+    &amp;&amp; pecl install redis \
+    &amp;&amp; docker-php-ext-enable redis \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    &amp;&amp; apt-get install -y nodejs \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+WORKDIR /var/www
+
+EXPOSE 8000 5173</code></pre>
+<p>O pacote que importa aqui é o poppler-utils. É ele que traz o pdftotext, a ferramenta de linha de comando que vai extrair o texto do edital. O Node entra porque o Vite vai precisar dele quando chegarmos na interface.</p>
+<p>Agora o docker-compose.yml na raiz:</p>
+<pre><code>services:
+  app:
+    build: ./docker/php
+    working_dir: /var/www
+    volumes:
+      - .:/var/www
+    ports:
+      - "8000:8000"
+      - "5173:5173"
+    command: php artisan serve --host=0.0.0.0 --port=8000
+    depends_on:
+      - db
+      - redis
+
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: edital
+      POSTGRES_USER: edital
+      POSTGRES_PASSWORD: secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+
+volumes:
+  pgdata:</code></pre>
+<p>Repare na imagem do banco. Em vez do postgres oficial, usamos pgvector/pgvector:pg17, que é o Postgres com a extensão já compilada dentro. Economiza uma dor de cabeça inteira.</p>
+<p>Se você já tem outro Postgres rodando na máquina, a porta 5432 vai estar ocupada e o container não sobe. A correção é trocar só o número da esquerda, por exemplo "5434:5432". O da direita é a porta dentro da rede do compose, que é a que a aplicação usa, e essa não muda.</p>
+<h2 id="projeto-laravel">Criando o projeto Laravel</h2>
+<p>Se você tem PHP e Composer na máquina:</p>
+<pre><code>composer create-project laravel/laravel edital-rag</code></pre>
+<p>Se preferir não depender do PHP local, um container descartável resolve:</p>
+<pre><code>docker run --rm -u "$(id -u):$(id -g)" -e COMPOSER_HOME=/tmp \
+  -v "$PWD":/app -w /app composer:2 \
+  composer create-project laravel/laravel .</code></pre>
+<p>Mova os arquivos do Docker para dentro da pasta do projeto e suba o ambiente:</p>
+<pre><code>docker compose build
+docker compose up -d</code></pre>
+<h2 id="conexao">Configurando a conexão</h2>
+<p>No .env, aponte o banco para o serviço do compose:</p>
+<pre><code>DB_CONNECTION=pgsql
+DB_HOST=db
+DB_PORT=5432
+DB_DATABASE=edital
+DB_USERNAME=edital
+DB_PASSWORD=secret
+
+CACHE_STORE=redis
+REDIS_HOST=redis
+
+OPENAI_API_KEY=sua-chave-aqui</code></pre>
+<p>O nome do host é db e não localhost porque, de dentro do container da aplicação, o banco é outro container. Esse é o erro número um de quem está começando com Docker, e vale a pena dizer em voz alta.</p>
+<h2 id="ai-sdk">Instalando o AI SDK</h2>
+<p>Todos os comandos daqui para frente rodam dentro do container:</p>
+<pre><code>docker compose exec app composer require laravel/ai
+
+docker compose exec app php artisan vendor:publish \
+    --provider="Laravel\Ai\AiServiceProvider"</code></pre>
+<p>O vendor:publish cria o config/ai.php e traz as migrations do pacote, que montam as tabelas de conversa que o SDK usa para guardar histórico de agentes. Não vamos precisar delas neste projeto, mas deixe rodar, custa nada.</p>
+<p>No config/ai.php vale conferir o modelo padrão de embeddings. Vamos usar o text-embedding-3-small da OpenAI, que gera vetores de 1536 dimensões e é barato o bastante para você reprocessar o mesmo edital dez vezes enquanto ajusta o tamanho dos pedaços sem sentir no cartão.</p>
+<h2 id="banco">Modelando o banco</h2>
+<p>Duas tabelas. Uma para o documento, outra para os pedaços dele.</p>
+<pre><code>docker compose exec app php artisan make:migration create_documents_table
+docker compose exec app php artisan make:migration create_document_chunks_table</code></pre>
+<p>A primeira é simples:</p>
+<p>Arquivo: database/migrations/2026_09_18_100000_create_documents_table.php</p>
+<pre><code>Schema::create('documents', function (Blueprint $table) {
+    $table-&gt;id();
+    $table-&gt;string('original_name');
+    $table-&gt;string('storage_path');
+    $table-&gt;string('status')-&gt;default('pending');
+    $table-&gt;unsignedInteger('page_count')-&gt;nullable();
+    $table-&gt;longText('extracted_text')-&gt;nullable();
+    $table-&gt;timestamps();
+});</code></pre>
+<p>O campo extracted_text guarda o texto que saiu do PDF. Guardar isso no banco parece desperdício, mas salva muito tempo: quando a busca devolver resultado estranho, você vai querer olhar exatamente o texto que foi indexado, sem reprocessar o arquivo.</p>
+<p>A segunda tabela é onde mora a parte interessante:</p>
+<p>Arquivo: database/migrations/2026_09_18_100100_create_document_chunks_table.php</p>
+<pre><code>use Illuminate\Support\Facades\DB;
+
+Schema::ensureVectorExtensionExists();
+
+Schema::create('document_chunks', function (Blueprint $table) {
+    $table-&gt;id();
+    $table-&gt;foreignId('document_id')-&gt;constrained()-&gt;cascadeOnDelete();
+    $table-&gt;unsignedInteger('page')-&gt;nullable();
+    $table-&gt;text('content');
+    $table-&gt;vector('embedding', dimensions: 1536)-&gt;nullable()-&gt;index();
+    $table-&gt;timestamps();
+});
+
+DB::statement("
+    ALTER TABLE document_chunks
+    ADD COLUMN content_tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('portuguese', content)) STORED
+");
+
+DB::statement('
+    CREATE INDEX document_chunks_content_tsv_idx
+    ON document_chunks USING GIN (content_tsv)
+');</code></pre>
+<p>Quatro coisas para comentar aqui.</p>
+<p>O Schema::ensureVectorExtensionExists() roda o CREATE EXTENSION IF NOT EXISTS vector para você. Precisa vir antes de qualquer coluna vetorial.</p>
+<p>O método vector() com index() cria a coluna e um índice HNSW com distância de cosseno. Em um documento só o índice não faz diferença de performance, porque o volume é pequeno demais. Ele está aí porque o dia em que você indexar cem editais vai fazer.</p>
+<p>O nullable() não é detalhe. O vector() cria a coluna como not null por padrão, e isso impediria gravar um pedaço antes de ter o vetor dele. Por isso a nulabilidade precisa estar na migration desde o início.</p>
+<p>A coluna content_tsv não tem equivalente no Blueprint do Laravel, por isso o SQL cru. Ela é uma coluna gerada: o Postgres calcula o tsvector automaticamente a partir do content, toda vez que a linha muda. Você nunca escreve nela. Ela não vai ser usada nesta série, e está aí de propósito, como gancho para a conversa sobre busca híbrida no último artigo.</p>
+<p>Rode as migrations:</p>
+<pre><code>docker compose exec app php artisan migrate</code></pre>
+<h2 id="schema">Conferindo o que foi criado</h2>
+<p>Vale olhar o schema antes de seguir, porque um erro aqui só apareceria muito mais tarde:</p>
+<pre><code>docker compose exec app php artisan db --sql "\\d document_chunks"</code></pre>
+<p>Ou direto no psql do container do banco. Três coisas devem aparecer: a coluna embedding com tipo vector(1536), a coluna content_tsv do tipo tsvector marcada como generated always as ... stored, e dois índices, um hnsw (embedding vector_cosine_ops) e um gin (content_tsv).</p>
+<h2 id="extracao">O primeiro teste de verdade: extrair o texto</h2>
+<p>Antes de pensar em embedding, vetor ou modelo de linguagem, tem uma pergunta que precisa ser respondida: esse PDF é legível por máquina. Muito edital de município pequeno é digitalizado, ou seja, é uma foto de papel dentro de um arquivo PDF. Nesse caso a extração devolve string vazia e o projeto inteiro para antes de começar.</p>
+<p>Vamos descobrir isso já:</p>
+<pre><code>docker compose exec app php artisan make:command ExtractPdfText</code></pre>
+<p>Arquivo: app/Console/Commands/ExtractPdfText.php</p>
+<pre><code>&lt;?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Process;
+
+class ExtractPdfText extends Command
+{
+    protected $signature = 'edital:extract {path} {--pages=1}';
+
+    protected $description = 'Extract raw text from a PDF file for inspection';
+
+    public function handle(): int
+    {
+        $path = $this-&gt;argument('path');
+
+        if (! is_file($path)) {
+            $this-&gt;error("File not found: {$path}");
+
+            return self::FAILURE;
+        }
+
+        $info = Process::run(['pdfinfo', $path]);
+        $this-&gt;line($info-&gt;output());
+
+        $result = Process::run([
+            'pdftotext',
+            '-layout',
+            '-f', '1',
+            '-l', (string) $this-&gt;option('pages'),
+            $path,
+            '-',
+        ]);
+
+        if (! $result-&gt;successful()) {
+            $this-&gt;error($result-&gt;errorOutput());
+
+            return self::FAILURE;
+        }
+
+        $text = trim($result-&gt;output());
+
+        if ($text === '') {
+            $this-&gt;error(
+                'No text extracted. This PDF is probably scanned and would need OCR.'
+            );
+
+            return self::FAILURE;
+        }
+
+        $this-&gt;newLine();
+        $this-&gt;line($text);
+
+        return self::SUCCESS;
+    }
+}</code></pre>
+<p>Baixe o edital, salve como storage/app/edital.pdf e rode:</p>
+<pre><code>docker compose exec app php artisan edital:extract storage/app/edital.pdf --pages=3</code></pre>
+<p>A flag -layout pede ao pdftotext que preserve o alinhamento das colunas. Sem ela, qualquer tabela vira uma sopa de números embaralhados. Com ela, a tabela pelo menos continua parecendo uma tabela.</p>
+<p>O pdfinfo no começo do comando não é enfeite. Ele mostra a contagem de páginas, que vamos usar depois, e dá uma pista sobre a origem do arquivo.</p>
+<h2 id="resultado">O que a saída real mostrou</h2>
+<p>No edital de Vargem Bonita o texto saiu limpo, com a numeração das cláusulas preservada no início da linha, no formato 2.5.1., e os títulos de seção em caixa alta. Se o texto aparece, o projeto está de pé, e é só isso que esta primeira parte precisa provar.</p>
+<p>Vale ler o cabeçalho do pdfinfo com atenção, porque ele antecipa a qualidade do que vem. Neste edital o campo Creator diz Acrobat PDFMaker 25 para Word, ou seja, o documento nasceu digital, foi escrito no Word e exportado. Por isso a extração sai limpa. Quando esse campo aponta um scanner, ou vem vazio num arquivo grande, é sinal de que o PDF é imagem e vai precisar de OCR.</p>
+<p>E aqui vai o primeiro aprendizado que só a saída real ensina. Eu ia ler o número da página do rodapé do documento, que aparece em todas as 48 páginas. Olhando a saída, o rodapé sai assim:</p>
+<pre><code>P á g i n a 3 | 48</code></pre>
+<p>O Word aplicou espaçamento entre as letras da palavra, e o pdftotext devolve esse espaçamento como espaço de verdade. Uma expressão regular escrita para Página não casaria com nada, e o pior é que falharia em silêncio: você acabaria com a página nula em todos os trechos e descobriria o motivo muito depois.</p>
+<p>Existe um caminho melhor, e ele aparece no próximo artigo. A lição geral, por enquanto, é essa: olhe a saída crua antes de escrever qualquer regra sobre ela.</p>
+<h2>Na próxima parte</h2>
+<p>A fundação está pronta: ambiente rodando, banco preparado para vetor, e a certeza de que o PDF é legível. Na segunda parte o texto vai para o banco em pedaços, com os vetores que o Laravel AI SDK gera em uma linha, e a primeira busca semântica começa a funcionar, ainda sem nenhum modelo generativo no meio.</p>
+<h2>Referências</h2>
+<p>LARAVEL. Laravel AI SDK. Documentação oficial, versão 13.x. Disponível em: https://laravel.com/framework/docs/ai-sdk. Acesso em: 18 set. 2026.</p>
+<p>MUNICÍPIO DE VARGEM BONITA. Pregão Eletrônico nº 006/2026: contratação de serviços de arbitragem esportiva. Processo Administrativo nº 012/2026. Vargem Bonita, SC, 2 fev. 2026. Disponível em: https://vargembonita.sc.gov.br/uploads/sites/93/2026/02/PL012.2026-PE006.2026-ARBITRAGEM.pdf. Acesso em: 18 set. 2026.</p>
