@@ -2,10 +2,11 @@
 
 > **RAG na prática · Parte 3 de 3**
 >
-> A versão publicável deste texto, em HTML para o editor do blog, está em
-> `artigos/parte-3-agente-e-interface.html`, junto com o título e o excerpt.
+> A versão final deste texto está publicada no paulorb.dev. Este arquivo registra apenas
+> a estrutura e as decisões técnicas da terceira parte.
 
-Este arquivo registra a estrutura e as decisões da Parte 3. O texto corrido está no HTML.
+Este arquivo registra a estrutura e as decisões da Parte 3. O texto corrido está na
+versão publicada no blog.
 
 ## Estrutura do artigo
 

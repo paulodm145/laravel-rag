@@ -46,8 +46,8 @@ este é um projeto didático, não um produto pronto para uso em processos licit
 3. [O agente, a checklist e os limites de um RAG mínimo](https://paulorb.dev/blog/parte-3-o-agente-a-checklist-e-os-limites-de-um-rag-minimo)  
    Agente com ferramenta de busca, schema, interface React e geração do PDF.
 
-Os HTMLs preparados para publicação estão em [artigos/](artigos/). As notas-fonte e o
-gabarito do edital de teste ficam em [docs/](docs/).
+Os textos publicados são mantidos no blog. As notas técnicas e o gabarito do edital de
+teste ficam em [docs/](docs/).
 
 ## O que a aplicação demonstra
 
@@ -242,8 +242,7 @@ resources/
     ├── hooks/useEditalAnalysis.js          chamada HTTP e estado
     └── utils/exportChecklistPdf.js         geração do PDF no navegador
 
-artigos/                                    HTML dos três artigos
-docs/                                       fontes e material de apoio
+docs/                                       notas técnicas e material de apoio
 ```
 
 ## Limites assumidos
