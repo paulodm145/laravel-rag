@@ -213,6 +213,28 @@ docker compose exec app php artisan edital:search "FGTS" 1 --limit=8
 docker compose exec app php artisan edital:analyze 1
 ```
 
+## Contribuindo
+
+As instruções completas do repositório estão em [AGENTS.md](AGENTS.md) e
+[CLAUDE.md](CLAUDE.md). Os dois arquivos têm o mesmo conteúdo e devem permanecer
+sincronizados.
+
+As contribuições seguem duas regras de versionamento:
+
+- **commits semânticos:** use Conventional Commits, como `feat:`, `fix:`, `docs:`,
+  `refactor:`, `test:`, `chore:` ou `build:`;
+- **commits atômicos:** cada commit deve conter uma única mudança coerente, fácil de
+  revisar e reverter.
+
+Antes do commit, revise o conteúdo preparado:
+
+```bash
+git diff --staged
+```
+
+Não versione `.env`, PDFs, uploads, logs, `vendor`, `node_modules` ou artefatos de build.
+Pull requests devem resumir o objetivo, as mudanças realizadas e as validações executadas.
+
 ## Verificações
 
 ```bash
